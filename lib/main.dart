@@ -32,7 +32,6 @@ class DailyReaderApp extends StatelessWidget {
   }
 }
 
-/// 一本书解析后的结构
 class Book {
   final String title;
   final List<Chapter> chapters;
@@ -54,6 +53,7 @@ class HomePage extends StatefulWidget {
 
 class _HomePageState extends State<HomePage> {
   bool _loading = false;
+  String _status = '';
 
   final Color backgroundColor = const Color(0xFFFFFDF5);
   final Color textColor = const Color(0xFF333333);
@@ -62,30 +62,55 @@ class _HomePageState extends State<HomePage> {
     final result = await FilePicker.platform.pickFiles(
       type: FileType.custom,
       allowedExtensions: ['epub'],
-      withData: false, // 流式读取，避免大书 OOM
+      withData: false,
     );
 
     if (result == null || result.files.single.path == null) return;
 
     final file = result.files.single;
 
-    setState(() => _loading = true);
+    setState(() {
+      _loading = true;
+      _status = '正在解析…';
+    });
 
     Book? book;
+    String errMsg = '';
     try {
       final bytes = await File(file.path!).readAsBytes();
       book = await _parseEpub(bytes, file.name);
-    } catch (e) {
+    } catch (e, st) {
+      debugPrint('❌ 解析异常: $e\n$st');
+      errMsg = e.toString();
       book = null;
-      debugPrint('EPUB 解析失败: $e');
     }
 
     if (!mounted) return;
-    setState(() => _loading = false);
+    setState(() {
+      _loading = false;
+      _status = '';
+    });
 
     if (book == null || book.chapters.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('没有找到 EPUB 正文内容')),
+      showDialog(
+        context: context,
+        builder: (_) => AlertDialog(
+          title: const Text('打开失败'),
+          content: Text(
+            '没有找到正文内容。\n\n'
+            '可能原因：\n'
+            '• 这本书是加密的（DRM）\n'
+            '• EPUB 结构异常\n'
+            '• 文件损坏\n\n'
+            '${errMsg.isNotEmpty ? '错误信息：$errMsg' : ''}',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('知道了'),
+            ),
+          ],
+        ),
       );
       return;
     }
@@ -102,194 +127,211 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
-  /// 解析 EPUB：
-  /// 1. 读 META-INF/container.xml 找 .opf
-  /// 2. 读 .opf 的 manifest + spine，得到正确章节顺序
-  /// 3. 按顺序解析每个 XHTML 为纯文本（保留段落换行）
+  // ================================================================
+  //  核心解析逻辑
+  // ================================================================
   Future<Book> _parseEpub(Uint8List data, String fallbackTitle) async {
     final archive = ZipDecoder().decodeBytes(data);
 
-    final Map<String, ArchiveFile> fileMap = {};
+    // 1. 把所有文件收集起来，建立小写路径 -> 文件 的索引
+    final Map<String, ArchiveFile> map = {};
+    final List<String> allPaths = [];
     for (final f in archive) {
-      if (f.isFile) {
-        fileMap[_normalize(f.name)] = f;
-      }
+      if (!f.isFile) continue;
+      final key = _norm(f.name);
+      map[key] = f;
+      allPaths.add(key);
     }
 
-    // ---------- 1. container.xml ----------
-    String opfPath = '';
-    final container = fileMap['meta-inf/container.xml'];
-    if (container != null) {
-      final xmlStr = _decodeBytes(_fileBytes(container));
-      try {
-        final doc = XmlDocument.parse(xmlStr);
-        final rootfile = doc.findAllElements('rootfile').firstOrNull;
-        opfPath = rootfile?.getAttribute('full-path') ?? '';
-      } catch (_) {}
-    }
+    debugPrint('📦 共 ${allPaths.length} 个文件');
+    debugPrint('📦 文件列表: $allPaths');
 
-    if (opfPath.isEmpty) {
-      return _fallbackParse(fileMap, fallbackTitle);
-    }
+    // 2. 找 OPF（走标准流程）；失败就 fallback
+    String? opfKey = _findOpfKey(map, allPaths);
+    debugPrint('📖 opfKey = $opfKey');
 
-    final opfKey = _normalize(opfPath);
-    final opfFile = fileMap[opfKey];
-    if (opfFile == null) {
-      return _fallbackParse(fileMap, fallbackTitle);
-    }
-
-    final opfXml = _decodeBytes(_fileBytes(opfFile));
-    final XmlDocument opfDoc;
-    try {
-      opfDoc = XmlDocument.parse(opfXml);
-    } catch (_) {
-      return _fallbackParse(fileMap, fallbackTitle);
-    }
-
-    final opfDir = p.dirname(opfKey);
-
-    // ---------- 2. manifest + spine ----------
-    final manifest = <String, String>{};
-    for (final item in opfDoc.findAllElements('item')) {
-      final id = item.getAttribute('id');
-      final href = item.getAttribute('href');
-      if (id != null && href != null) {
-        manifest[id] = href;
-      }
-    }
-
-    final spineIds = <String>[];
-    for (final itemref in opfDoc.findAllElements('itemref')) {
-      final idref = itemref.getAttribute('idref');
-      if (idref != null) spineIds.add(idref);
-    }
-
+    List<String> orderedFiles = [];
     String title = fallbackTitle;
-    final titleEl = opfDoc.findAllElements('dc:title').firstOrNull ??
-        opfDoc.findAllElements('title').firstOrNull;
-    if (titleEl != null && titleEl.text.trim().isNotEmpty) {
-      title = titleEl.text.trim();
-    }
 
-    // ---------- 3. 按 spine 顺序解析 ----------
-    final chapters = <Chapter>[];
+    if (opfKey != null) {
+      try {
+        final opfXml = _decodeBytes(_bytes(map[opfKey]!));
+        final doc = XmlDocument.parse(opfXml);
 
-    for (final id in spineIds) {
-      final href = manifest[id];
-      if (href == null) continue;
-
-      final cleanHref = href.split('#').first;
-      final fullPath = _normalize(p.join(opfDir, cleanHref));
-
-      final entry = fileMap[fullPath];
-      if (entry == null) continue;
-
-      final text = _htmlToPlainText(_fileBytes(entry));
-      if (text.trim().isEmpty) continue;
-
-      final chapterTitle =
-          _extractTitle(text) ?? '第 ${chapters.length + 1} 章';
-
-      chapters.add(Chapter(title: chapterTitle, content: text));
-    }
-
-    return Book(title: title, chapters: chapters);
-  }
-
-  /// 找不到 opf 时退化处理
-  Book _fallbackParse(Map<String, ArchiveFile> fileMap, String title) {
-    final chapters = <Chapter>[];
-    final keys = fileMap.keys.toList()..sort();
-
-    for (final key in keys) {
-      if (key.endsWith('.xhtml') ||
-          key.endsWith('.html') ||
-          key.endsWith('.htm')) {
-        final text = _htmlToPlainText(_fileBytes(fileMap[key]!));
-        if (text.trim().isEmpty) continue;
-
-        chapters.add(Chapter(
-          title: _extractTitle(text) ?? '第 ${chapters.length + 1} 章',
-          content: text,
-        ));
-      }
-    }
-    return Book(title: title, chapters: chapters);
-  }
-
-  // ---------- 工具 ----------
-
-  Uint8List _fileBytes(ArchiveFile f) =>
-      Uint8List.fromList(f.content as List<int>);
-
-  String _decodeBytes(Uint8List bytes) {
-    try {
-      return utf8.decode(bytes);
-    } catch (_) {
-      return latin1.decode(bytes);
-    }
-  }
-
-  String _normalize(String path) =>
-      path.replaceAll('\\', '/').toLowerCase();
-
-  /// HTML -> 纯文本，保留段落换行
-  String _htmlToPlainText(Uint8List bytes) {
-    final html = _decodeBytes(bytes);
-    final doc = html_parser.parse(html);
-    final body = doc.body;
-    if (body == null) return '';
-
-    final buffer = StringBuffer();
-
-    void walk(dom.Node node) {
-      if (node is dom.Text) {
-        buffer.write(node.text);
-      } else if (node is dom.Element) {
-        final tag = node.localName;
-        final isBlock = const {
-          'p', 'div', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
-          'li', 'blockquote', 'section', 'article', 'tr',
-        }.contains(tag);
-
-        if (isBlock && buffer.isNotEmpty && !buffer.toString().endsWith('\n\n')) {
-          buffer.write('\n\n');
+        // 书名
+        final t = doc.findAllElements('dc:title').firstOrNull ??
+            doc.findAllElements('title').firstOrNull;
+        if (t != null && t.text.trim().isNotEmpty) {
+          title = t.text.trim();
         }
 
-        if (tag == 'br') {
-          buffer.write('\n');
-        } else {
-          for (final child in node.nodes) {
-            walk(child);
+        // manifest: id -> href
+        final manifest = <String, String>{};
+        for (final e in doc.findAllElements('item')) {
+          final id = e.getAttribute('id');
+          final href = e.getAttribute('href');
+          final mt = e.getAttribute('media-type') ?? '';
+          if (id != null && href != null) {
+            if (mt.contains('html') ||
+                href.toLowerCase().endsWith('.xhtml') ||
+                href.toLowerCase().endsWith('.html') ||
+                href.toLowerCase().endsWith('.htm')) {
+              manifest[id] = href;
+            }
           }
         }
 
-        if (isBlock && !buffer.toString().endsWith('\n\n')) {
-          buffer.write('\n\n');
+        // spine 顺序
+        final opfDir = p.dirname(opfKey);
+        for (final e in doc.findAllElements('itemref')) {
+          final idref = e.getAttribute('idref');
+          if (idref == null) continue;
+          final href = manifest[idref];
+          if (href == null) continue;
+          final clean = href.split('#').first;
+          final full = _norm(p.join(opfDir, clean));
+          if (map.containsKey(full)) {
+            orderedFiles.add(full);
+          }
         }
+
+        debugPrint('📖 spine 顺序文件数: ${orderedFiles.length}');
+      } catch (e) {
+        debugPrint('⚠️ OPF 解析失败，走 fallback: $e');
+        opfKey = null;
       }
     }
 
-    for (final child in body.nodes) {
-      walk(child);
+    // 3. 如果 spine 拿到的为空，就把所有 html 文件按路径排序当章节
+    if (orderedFiles.isEmpty) {
+      orderedFiles = allPaths
+          .where((k) =>
+              k.endsWith('.xhtml') ||
+              k.endsWith('.html') ||
+              k.endsWith('.htm'))
+          .toList()
+        ..sort();
+      debugPrint('📖 fallback 顺序文件数: ${orderedFiles.length}');
     }
 
-    return buffer
+    // 4. 逐个解析成纯文本
+    final chapters = <Chapter>[];
+    for (final key in orderedFiles) {
+      final f = map[key];
+      if (f == null) continue;
+      final text = _htmlToText(_bytes(f));
+      if (text.trim().isEmpty) continue;
+      chapters.add(Chapter(
+        title: _guessTitle(text, chapters.length + 1),
+        content: text,
+      ));
+    }
+
+    debugPrint('✅ 章节数: ${chapters.length}');
+    return Book(title: title, chapters: chapters);
+  }
+
+  // 在压缩包里找 opf
+  String? _findOpfKey(Map<String, ArchiveFile> map, List<String> allPaths) {
+    // 优先从 container.xml 拿
+    final c = map['meta-inf/container.xml'];
+    if (c != null) {
+      try {
+        final doc = XmlDocument.parse(_decodeBytes(_bytes(c)));
+        final rf = doc.findAllElements('rootfile').firstOrNull;
+        final full = rf?.getAttribute('full-path');
+        if (full != null && full.isNotEmpty) {
+          final key = _norm(full);
+          if (map.containsKey(key)) return key;
+        }
+      } catch (_) {}
+    }
+    // 退而求其次：扫全包里第一个 .opf
+    for (final k in allPaths) {
+      if (k.endsWith('.opf')) return k;
+    }
+    return null;
+  }
+
+  // ================================================================
+  //  工具
+  // ================================================================
+  Uint8List _bytes(ArchiveFile f) =>
+      Uint8List.fromList(f.content as List<int>);
+
+  String _decodeBytes(Uint8List bytes) {
+    // 先试 UTF-8，失败试 GBK 系（中文电子书常见）
+    try {
+      return utf8.decode(bytes);
+    } catch (_) {}
+    try {
+      // latin1 兜底，虽然会乱码但不至于抛异常
+      return latin1.decode(bytes);
+    } catch (_) {
+      return '';
+    }
+  }
+
+  String _norm(String path) => path.replaceAll('\\', '/').toLowerCase();
+
+  /// HTML -> 纯文本（保留段落换行）
+  String _htmlToText(Uint8List bytes) {
+    final html = _decodeBytes(bytes);
+    if (html.isEmpty) return '';
+
+    final doc = html_parser.parse(html);
+    final body = doc.body ?? doc.documentElement;
+    if (body == null) return '';
+
+    final buf = StringBuffer();
+
+    void walk(dom.Node node) {
+      if (node is dom.Text) {
+        buf.write(node.text);
+        return;
+      }
+      if (node is! dom.Element) return;
+
+      final tag = node.localName?.toLowerCase() ?? '';
+      const blockTags = {
+        'p', 'div', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+        'li', 'blockquote', 'section', 'article', 'tr', 'br',
+      };
+      final isBlock = blockTags.contains(tag);
+
+      if (isBlock && buf.isNotEmpty && !buf.toString().endsWith('\n')) {
+        buf.write('\n');
+      }
+      if (tag == 'br') {
+        buf.write('\n');
+        return;
+      }
+      for (final c in node.nodes) {
+        walk(c);
+      }
+      if (isBlock && !buf.toString().endsWith('\n')) {
+        buf.write('\n');
+      }
+    }
+
+    for (final c in body.nodes) {
+      walk(c);
+    }
+
+    return buf
         .toString()
         .replaceAll(RegExp(r'[ \t]+\n'), '\n')
         .replaceAll(RegExp(r'\n{3,}'), '\n\n')
         .trim();
   }
 
-  String? _extractTitle(String text) {
-    final firstLine = text.split('\n').firstWhere(
-          (l) => l.trim().isNotEmpty,
-          orElse: () => '',
-        );
-    if (firstLine.isEmpty) return null;
-    return firstLine.length > 30
-        ? '${firstLine.substring(0, 30)}…'
-        : firstLine;
+  String _guessTitle(String text, int index) {
+    final first = text
+        .split('\n')
+        .map((l) => l.trim())
+        .firstWhere((l) => l.isNotEmpty, orElse: () => '');
+    if (first.isEmpty) return '第 $index 章';
+    return first.length > 30 ? '${first.substring(0, 30)}…' : first;
   }
 
   @override
@@ -311,9 +353,11 @@ class _HomePageState extends State<HomePage> {
               const SizedBox(height: 12),
               const Text('选择一本 EPUB 开始阅读'),
               const SizedBox(height: 32),
-              if (_loading)
-                const CircularProgressIndicator()
-              else
+              if (_loading) ...[
+                const CircularProgressIndicator(),
+                const SizedBox(height: 12),
+                Text(_status),
+              ] else
                 FilledButton.icon(
                   onPressed: openEpub,
                   icon: const Icon(Icons.folder_open),
@@ -346,7 +390,7 @@ class ReaderPage extends StatefulWidget {
 class _ReaderPageState extends State<ReaderPage> {
   late int chapter;
   double fontSize = 20;
-  final ScrollController _scrollCtrl = ScrollController();
+  final ScrollController _ctrl = ScrollController();
 
   String get _progressKey => 'chapter_${widget.book.title}';
 
@@ -359,7 +403,7 @@ class _ReaderPageState extends State<ReaderPage> {
 
   @override
   void dispose() {
-    _scrollCtrl.dispose();
+    _ctrl.dispose();
     super.dispose();
   }
 
@@ -378,73 +422,60 @@ class _ReaderPageState extends State<ReaderPage> {
     await prefs.setInt(_progressKey, chapter);
   }
 
-  void _goToChapter(int index) {
+  void _goTo(int index) {
     if (index < 0 || index >= widget.book.chapters.length) return;
     setState(() => chapter = index);
     _saveProgress();
-    if (_scrollCtrl.hasClients) {
-      _scrollCtrl.jumpTo(0);
-    }
+    if (_ctrl.hasClients) _ctrl.jumpTo(0);
   }
 
   void _showChapterList() {
     showModalBottomSheet(
       context: context,
-      builder: (_) {
-        return ListView.builder(
-          itemCount: widget.book.chapters.length,
-          itemBuilder: (_, i) {
-            final c = widget.book.chapters[i];
-            return ListTile(
-              selected: i == chapter,
-              title: Text(
-                c.title,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-              ),
-              onTap: () {
-                Navigator.pop(context);
-                _goToChapter(i);
-              },
-            );
-          },
-        );
-      },
+      builder: (_) => ListView.builder(
+        itemCount: widget.book.chapters.length,
+        itemBuilder: (_, i) {
+          final c = widget.book.chapters[i];
+          return ListTile(
+            selected: i == chapter,
+            title: Text(c.title, maxLines: 1, overflow: TextOverflow.ellipsis),
+            onTap: () {
+              Navigator.pop(context);
+              _goTo(i);
+            },
+          );
+        },
+      ),
     );
   }
 
   void _showFontSheet() {
     showModalBottomSheet(
       context: context,
-      builder: (_) {
-        return StatefulBuilder(
-          builder: (context, setSheetState) {
-            return Padding(
-              padding: const EdgeInsets.all(24),
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  const Text(
-                    '字体大小',
-                    style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-                  ),
-                  Slider(
-                    min: 14,
-                    max: 32,
-                    value: fontSize,
-                    onChanged: (value) {
-                      setState(() => fontSize = value);
-                      setSheetState(() {});
-                    },
-                  ),
-                  Text('${fontSize.toInt()} px'),
-                  const SizedBox(height: 20),
-                ],
+      builder: (_) => StatefulBuilder(
+        builder: (context, setSheet) => Padding(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Text('字体大小',
+                  style:
+                      TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+              Slider(
+                min: 14,
+                max: 32,
+                value: fontSize,
+                onChanged: (v) {
+                  setState(() => fontSize = v);
+                  setSheet(() {});
+                },
               ),
-            );
-          },
-        );
-      },
+              Text('${fontSize.toInt()} px'),
+              const SizedBox(height: 20),
+            ],
+          ),
+        ),
+      ),
     );
   }
 
@@ -456,29 +487,23 @@ class _ReaderPageState extends State<ReaderPage> {
     return Scaffold(
       backgroundColor: widget.backgroundColor,
       appBar: AppBar(
-        title: Text(
-          widget.book.title,
-          maxLines: 1,
-          overflow: TextOverflow.ellipsis,
-        ),
         backgroundColor: widget.backgroundColor,
+        title: Text(widget.book.title,
+            maxLines: 1, overflow: TextOverflow.ellipsis),
         actions: [
           IconButton(
-            icon: const Icon(Icons.list),
-            tooltip: '章节列表',
-            onPressed: _showChapterList,
-          ),
+              icon: const Icon(Icons.list),
+              tooltip: '章节列表',
+              onPressed: _showChapterList),
           IconButton(
-            icon: const Icon(Icons.text_fields),
-            onPressed: _showFontSheet,
-          ),
+              icon: const Icon(Icons.text_fields), onPressed: _showFontSheet),
         ],
       ),
       body: Column(
         children: [
           Expanded(
             child: ListView(
-              controller: _scrollCtrl,
+              controller: _ctrl,
               padding: const EdgeInsets.fromLTRB(24, 30, 24, 80),
               children: [
                 SelectableText(
@@ -495,22 +520,20 @@ class _ReaderPageState extends State<ReaderPage> {
           SafeArea(
             top: false,
             child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+              padding:
+                  const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
               color: widget.backgroundColor,
               child: Row(
                 mainAxisAlignment: MainAxisAlignment.spaceBetween,
                 children: [
                   IconButton(
-                    onPressed: chapter > 0
-                        ? () => _goToChapter(chapter - 1)
-                        : null,
+                    onPressed: chapter > 0 ? () => _goTo(chapter - 1) : null,
                     icon: const Icon(Icons.chevron_left),
                   ),
                   Text('${chapter + 1} / $total'),
                   IconButton(
-                    onPressed: chapter < total - 1
-                        ? () => _goToChapter(chapter + 1)
-                        : null,
+                    onPressed:
+                        chapter < total - 1 ? () => _goTo(chapter + 1) : null,
                     icon: const Icon(Icons.chevron_right),
                   ),
                 ],
