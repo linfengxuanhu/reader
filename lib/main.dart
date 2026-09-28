@@ -7,9 +7,7 @@ import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:html/dom.dart' as dom;
 import 'package:html/parser.dart' as html_parser;
-import 'package:path/path.dart' as p;
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:xml/xml.dart';
 
 void main() {
   runApp(const DailyReaderApp());
@@ -78,7 +76,7 @@ class _HomePageState extends State<HomePage> {
     String errMsg = '';
     try {
       final bytes = await File(file.path!).readAsBytes();
-      book = await _parseEpub(bytes, file.name);
+      book = _parseEpub(bytes, file.name);
     } catch (e, st) {
       debugPrint('❌ 解析异常: $e\n$st');
       errMsg = e.toString();
@@ -128,129 +126,95 @@ class _HomePageState extends State<HomePage> {
   }
 
   // ================================================================
-  //  核心解析逻辑
+  //  傻瓜稳妥解析：不依赖 OPF，直接扫所有 html/xhtml/xml 文件
   // ================================================================
-  Future<Book> _parseEpub(Uint8List data, String fallbackTitle) async {
+  Book _parseEpub(Uint8List data, String fallbackTitle) {
     final archive = ZipDecoder().decodeBytes(data);
 
-    // 1. 把所有文件收集起来，建立小写路径 -> 文件 的索引
+    // 收集所有候选正文文件
     final Map<String, ArchiveFile> map = {};
-    final List<String> allPaths = [];
     for (final f in archive) {
       if (!f.isFile) continue;
       final key = _norm(f.name);
+      // 跳过明显的非正文
+      if (key.startsWith('meta-inf/')) continue;
+      if (key.contains('/images/')) continue;
+      if (key.endsWith('.jpg') ||
+          key.endsWith('.jpeg') ||
+          key.endsWith('.png') ||
+          key.endsWith('.gif') ||
+          key.endsWith('.css') ||
+          key.endsWith('.js') ||
+          key.endsWith('.ttf') ||
+          key.endsWith('.otf') ||
+          key.endsWith('.woff')) {
+        continue;
+      }
       map[key] = f;
-      allPaths.add(key);
     }
 
-    debugPrint('📦 共 ${allPaths.length} 个文件');
-    debugPrint('📦 文件列表: $allPaths');
+    debugPrint('📦 候选文件 ${map.length} 个');
 
-    // 2. 找 OPF（走标准流程）；失败就 fallback
-    String? opfKey = _findOpfKey(map, allPaths);
-    debugPrint('📖 opfKey = $opfKey');
-
-    List<String> orderedFiles = [];
-    String title = fallbackTitle;
-
-    if (opfKey != null) {
-      try {
-        final opfXml = _decodeBytes(_bytes(map[opfKey]!));
-        final doc = XmlDocument.parse(opfXml);
-
-        // 书名
-        final t = doc.findAllElements('dc:title').firstOrNull ??
-            doc.findAllElements('title').firstOrNull;
-        if (t != null && t.text.trim().isNotEmpty) {
-          title = t.text.trim();
-        }
-
-        // manifest: id -> href
-        final manifest = <String, String>{};
-        for (final e in doc.findAllElements('item')) {
-          final id = e.getAttribute('id');
-          final href = e.getAttribute('href');
-          final mt = e.getAttribute('media-type') ?? '';
-          if (id != null && href != null) {
-            if (mt.contains('html') ||
-                href.toLowerCase().endsWith('.xhtml') ||
-                href.toLowerCase().endsWith('.html') ||
-                href.toLowerCase().endsWith('.htm')) {
-              manifest[id] = href;
-            }
-          }
-        }
-
-        // spine 顺序
-        final opfDir = p.dirname(opfKey);
-        for (final e in doc.findAllElements('itemref')) {
-          final idref = e.getAttribute('idref');
-          if (idref == null) continue;
-          final href = manifest[idref];
-          if (href == null) continue;
-          final clean = href.split('#').first;
-          final full = _norm(p.join(opfDir, clean));
-          if (map.containsKey(full)) {
-            orderedFiles.add(full);
-          }
-        }
-
-        debugPrint('📖 spine 顺序文件数: ${orderedFiles.length}');
-      } catch (e) {
-        debugPrint('⚠️ OPF 解析失败，走 fallback: $e');
-        opfKey = null;
+    // 找出所有可能是正文的文件
+    // 扩展名 + 目录名都做点判断，尽量全面
+    final List<String> candidates = [];
+    for (final k in map.keys) {
+      final isHtml = k.endsWith('.xhtml') ||
+          k.endsWith('.html') ||
+          k.endsWith('.htm');
+      final isXml = k.endsWith('.xml');
+      // xml 里排除 OPF、NCX 等结构性文件
+      final isStructural = k.endsWith('.opf') ||
+          k.endsWith('.ncx') ||
+          k.contains('container.xml') ||
+          k.contains('content.opf') ||
+          k.contains('toc.');
+      if (isHtml) {
+        candidates.add(k);
+      } else if (isXml && !isStructural) {
+        candidates.add(k);
       }
     }
 
-    // 3. 如果 spine 拿到的为空，就把所有 html 文件按路径排序当章节
-    if (orderedFiles.isEmpty) {
-      orderedFiles = allPaths
-          .where((k) =>
-              k.endsWith('.xhtml') ||
-              k.endsWith('.html') ||
-              k.endsWith('.htm'))
-          .toList()
-        ..sort();
-      debugPrint('📖 fallback 顺序文件数: ${orderedFiles.length}');
-    }
+    candidates.sort();
+    debugPrint('📖 正文候选 ${candidates.length} 个: $candidates');
 
-    // 4. 逐个解析成纯文本
+    // 逐个解析成文本
     final chapters = <Chapter>[];
-    for (final key in orderedFiles) {
+    for (final key in candidates) {
       final f = map[key];
       if (f == null) continue;
       final text = _htmlToText(_bytes(f));
       if (text.trim().isEmpty) continue;
+
+      // 过滤太短的段落（可能只是目录页/版权页）
+      if (text.trim().length < 30) continue;
+
       chapters.add(Chapter(
         title: _guessTitle(text, chapters.length + 1),
         content: text,
       ));
     }
 
-    debugPrint('✅ 章节数: ${chapters.length}');
-    return Book(title: title, chapters: chapters);
-  }
+    debugPrint('✅ 最终章节数: ${chapters.length}');
 
-  // 在压缩包里找 opf
-  String? _findOpfKey(Map<String, ArchiveFile> map, List<String> allPaths) {
-    // 优先从 container.xml 拿
-    final c = map['meta-inf/container.xml'];
-    if (c != null) {
+    // 书名：从 container 或 opf 里拿一下，拿不到就用文件名
+    String title = fallbackTitle;
+    final opfKeys = map.keys.where((k) => k.endsWith('.opf')).toList();
+    if (opfKeys.isNotEmpty) {
       try {
-        final doc = XmlDocument.parse(_decodeBytes(_bytes(c)));
-        final rf = doc.findAllElements('rootfile').firstOrNull;
-        final full = rf?.getAttribute('full-path');
-        if (full != null && full.isNotEmpty) {
-          final key = _norm(full);
-          if (map.containsKey(key)) return key;
+        final opfXml = _decodeBytes(_bytes(map[opfKeys.first]!));
+        final m = RegExp(r'<dc:title[^>]*>(.*?)</dc:title>',
+                dotAll: true, caseSensitive: false)
+            .firstMatch(opfXml);
+        if (m != null) {
+          final t = m.group(1)!.trim();
+          if (t.isNotEmpty) title = t;
         }
       } catch (_) {}
     }
-    // 退而求其次：扫全包里第一个 .opf
-    for (final k in allPaths) {
-      if (k.endsWith('.opf')) return k;
-    }
-    return null;
+
+    return Book(title: title, chapters: chapters);
   }
 
   // ================================================================
@@ -260,12 +224,10 @@ class _HomePageState extends State<HomePage> {
       Uint8List.fromList(f.content as List<int>);
 
   String _decodeBytes(Uint8List bytes) {
-    // 先试 UTF-8，失败试 GBK 系（中文电子书常见）
     try {
       return utf8.decode(bytes);
     } catch (_) {}
     try {
-      // latin1 兜底，虽然会乱码但不至于抛异常
       return latin1.decode(bytes);
     } catch (_) {
       return '';
@@ -306,6 +268,9 @@ class _HomePageState extends State<HomePage> {
         buf.write('\n');
         return;
       }
+      // 跳过 script / style
+      if (tag == 'script' || tag == 'style') return;
+
       for (final c in node.nodes) {
         walk(c);
       }
@@ -459,8 +424,8 @@ class _ReaderPageState extends State<ReaderPage> {
             mainAxisSize: MainAxisSize.min,
             children: [
               const Text('字体大小',
-                  style:
-                      TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                  style: TextStyle(
+                      fontSize: 18, fontWeight: FontWeight.bold)),
               Slider(
                 min: 14,
                 max: 32,
